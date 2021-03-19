@@ -2,16 +2,14 @@ package capture
 
 import (
 	"context"
-	"encoding/binary"
-	"io/ioutil"
 	"net"
-	"os"
-	"sync/atomic"
+	"runtime"
 	"testing"
-	"time"
+	"unsafe"
 
-	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+	raw "github.com/urbanishimwe/packet"
+	"golang.org/x/sys/unix"
 )
 
 var LoopBack = func() net.Interface {
@@ -60,54 +58,6 @@ func TestBPFFilter(t *testing.T) {
 	}
 }
 
-func TestPcapDump(t *testing.T) {
-	f, err := ioutil.TempFile("", "pcap_file")
-	if err != nil {
-		t.Error(err)
-	}
-	h, _ := PcapDumpHandler(f, layers.LinkTypeLoop)
-	packets := Packets(1, 5, 5, 4)
-	for i := 0; i < len(packets); i++ {
-		if i == 1 {
-			// change dst port
-			binary.BigEndian.PutUint16(packets[i].TransLayer[2:], 8001)
-		}
-		if i == 4 {
-			packets[i].Info.CaptureLength = 40
-		}
-		h(packets[i])
-	}
-	name := f.Name()
-	f.Close()
-	testPcapDumpEngine(name, t)
-}
-
-func testPcapDumpEngine(f string, t *testing.T) {
-	defer os.Remove(f)
-	l, err := NewListener(f, 8000, "", EnginePcapFile, true)
-	err = l.Activate()
-	if err != nil {
-		t.Errorf("expected error to be nil, got %q", err)
-		return
-	}
-	pckts := 0
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	err = l.Listen(ctx, func(packet *Packet) {
-		if packet.Info.CaptureLength != 57 {
-			t.Errorf("expected packet length to be %d, got %d", 57, packet.Info.CaptureLength)
-		}
-		pckts++
-	})
-
-	if err != nil {
-		t.Errorf("expected error to be nil, got %q", err)
-	}
-	if pckts != 3 {
-		t.Errorf("expected %d packets, got %d packets", 3, pckts)
-	}
-}
-
 func TestPcapHandler(t *testing.T) {
 	l, err := NewListener(LoopBack.Name, 8000, "", EnginePcap, true)
 	if err != nil {
@@ -133,181 +83,171 @@ func TestPcapHandler(t *testing.T) {
 	}
 }
 
-func TestSocketHandler(t *testing.T) {
-	l, err := NewListener(LoopBack.Name, 8000, "", EngineRawSocket, true)
+func TestWriteRawSocket(t *testing.T) {
+	l, err := initListener(LoopBack.Name, 8000, EngineRawSocket, true, nil)
 	err = l.Activate()
 	if err != nil {
 		return
 	}
-	defer l.Handles[LoopBack.Name].(*SockRaw).Close()
-	if err != nil {
-		t.Errorf("expected error to be nil, got %v", err)
+	defer l.closeHandles(LoopBack.Name)
+	h := l.Handles[LoopBack.Name].(*socket).h
+	if err = writeSocket(h); err != nil {
+		t.Fatal(err.Error())
 		return
 	}
-	for i := 0; i < 5; i++ {
-		_, _ = net.Dial("tcp", "127.0.0.1:8000")
-	}
-	sts, _ := l.Handles[LoopBack.Name].(*SockRaw).Stats()
-	if sts.Packets < 5 {
-		t.Errorf("expected >=5 packets got %d", sts.Packets)
-	}
-}
-
-func BenchmarkPcapDump(b *testing.B) {
-	f, err := ioutil.TempFile("", "pcap_file")
-	if err != nil {
-		b.Error(err)
-		return
-	}
-	now := time.Now()
-	defer os.Remove(f.Name())
-	h, _ := PcapDumpHandler(f, layers.LinkTypeLoop)
-	packets := Packets(1, b.N, 5, 4)
-	for i := 0; i < len(packets); i++ {
-		h(packets[i])
-	}
-	f.Close()
-	b.Logf("%d packets in %s", b.N, time.Since(now))
 }
 
 func BenchmarkPcapFile(b *testing.B) {
-	f, err := ioutil.TempFile("", "pcap_file")
-	if err != nil {
-		b.Error(err)
-		return
-	}
-	defer os.Remove(f.Name())
-	h, _ := PcapDumpHandler(f, layers.LinkTypeLoop)
-	packets := Packets(1, b.N, 5, 4)
-	for i := 0; i < len(packets); i++ {
-		h(packets[i])
-	}
-	name := f.Name()
-	f.Close()
-	b.ResetTimer()
-	var l *Listener
-	l, err = NewListener(name, 8000, "", EnginePcapFile, true)
-	if err != nil {
-		b.Error(err)
-		return
-	}
-	err = l.Activate()
-	if err != nil {
-		b.Error(err)
-		return
-	}
-	now := time.Now()
-	pckts := 0
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if err = l.Listen(ctx, func(packet *Packet) {
-		if packet.Info.CaptureLength != 49 {
-			b.Errorf("expected packet length to be %d, got %d", 49, packet.Info.CaptureLength)
-		}
-		pckts++
-	}); err != nil {
-		b.Error(err)
-	}
-	b.Logf("%d/%d packets in %s", pckts, b.N, time.Since(now))
-}
-
-// used to benchmark sock engine
-var buf [1024]byte
-
-func init() {
-	for i := 0; i < len(buf); i++ {
-		buf[i] = 0xff
-	}
-}
-
-func handler(n, counter *int32) Handler {
-	return func(p *Packet) {
-		nn := int32(len(p.Data))
-		atomic.AddInt32(n, nn)
-		atomic.AddInt32(counter, 1)
-	}
-}
-
-func BenchmarkPcap(b *testing.B) {
-	var err error
-	n := new(int32)
-	counter := new(int32)
-	l, err := NewListener(LoopBack.Name, 8000, "", EnginePcap, false)
-	if err != nil {
-		b.Error(err)
-		return
-	}
-	l.PcapOptions.BPFFilter = "udp dst port 8000 and host 127.0.0.1"
-	err = l.Activate()
-	if err != nil {
-		b.Error(err)
-		return
-	}
-	errCh := l.ListenBackground(context.Background(), handler(n, counter))
-	select {
-	case <-l.Reading:
-	case err = <-errCh:
-		b.Error(err)
-		return
-	}
-	var conn net.Conn
-	b.ResetTimer()
+	runtime.GOMAXPROCS(1)
+	ps := 0
 	for i := 0; i < b.N; i++ {
+		ps = 0
 		b.StopTimer()
-		conn, err = net.Dial("udp", "127.0.0.1:8000")
+		l, err := initListener("testdata/ip6", 0, EnginePcapFile, true, nil)
 		if err != nil {
-			b.Error(err)
-			return
+			b.Fatal(err.Error())
 		}
 		b.StartTimer()
-		_, err = conn.Write(buf[:])
-		if err != nil {
-			b.Error(err)
-			return
-		}
+		l.Listen(context.Background(), func(*Packet) {
+			ps++
+		})
 	}
-	b.ReportMetric(float64(atomic.LoadInt32(n)), "buf")
-	b.ReportMetric(float64(atomic.LoadInt32(counter)), "packets")
+	b.ReportMetric(float64(ps), "packets/op")
 }
 
-func BenchmarkRawSocket(b *testing.B) {
-	var err error
-	n := new(int32)
-	counter := new(int32)
-	l, err := NewListener(LoopBack.Name, 8000, "", EngineRawSocket, false)
+func BenchmarkReadSocketBufferFull(b *testing.B) {
+	b.StopTimer()
+	for i := 0; i < b.N; i++ {
+		l, err := initListener(LoopBack.Name, 0, EngineRawSocket, true, nil)
+		if err != nil {
+			b.Skip(err.Error())
+		}
+		h := l.Handles[LoopBack.Name].(*socket).h
+		if err = writeSocket(h); err != nil {
+			b.Fatal(err.Error())
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		b.StartTimer()
+		ps := 0
+		l.Listen(ctx, func(*Packet) {
+			ps++
+			if ps >= 1000 {
+				b.StopTimer()
+				h.BreakLoop()
+				cancel()
+			}
+		})
+		b.StopTimer()
+		cancel()
+		b.ReportMetric(float64(ps), "packets/op")
+		ps = 0
+	}
+}
+
+func BenchmarkReadPcapBufferFull(b *testing.B) {
+	b.StopTimer()
+	for i := 0; i < b.N; i++ {
+		l, err := initListener(LoopBack.Name, 0, EnginePcap, true, &PcapOptions{BufferTimeout: 1})
+		if err != nil {
+			b.Skip(err.Error())
+		}
+		h := l.Handles[LoopBack.Name].(*pcap.Handle)
+		if err = writePcap(h); err != nil {
+			b.Fatal(err.Error())
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		b.StartTimer()
+		ps := 0
+		l.Listen(ctx, func(*Packet) {
+			ps++
+			if ps >= 1000 {
+				b.StopTimer()
+				h.Close()
+				cancel()
+			}
+		})
+		b.StopTimer()
+		cancel()
+		b.ReportMetric(float64(ps), "packets/op")
+		ps = 0
+	}
+}
+
+func initListener(addr string, port uint16, eng EngineType, response bool, opt *PcapOptions) (l *Listener, err error) {
+	l, err = NewListener(addr, port, "", eng, true)
 	if err != nil {
-		b.Error(err)
 		return
 	}
-	l.PcapOptions.BPFFilter = "udp dst port 8000 and host 127.0.0.1"
 	err = l.Activate()
 	if err != nil {
-		b.Error(err)
 		return
 	}
-	errCh := l.ListenBackground(context.Background(), handler(n, counter))
-	select {
-	case <-l.Reading:
-	case err = <-errCh:
-		b.Error(err)
-		return
+	if opt != nil {
+		l.SetPcapOptions(*opt)
 	}
-	var conn net.Conn
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		conn, err = net.Dial("udp", "127.0.0.1:8000")
-		if err != nil {
-			b.Error(err)
-			return
-		}
-		b.StartTimer()
-		_, err = conn.Write(buf[:])
-		if err != nil {
-			b.Error(err)
-			return
+	return
+}
+
+func readPackets(f string) [][]byte {
+	ps := make([][]byte, 0, 10)
+	handle, err := pcap.OpenOffline(f)
+	if err != nil {
+		return nil
+	}
+	var r []byte
+	for err == nil {
+		r, _, err = handle.ReadPacketData()
+		if len(r) > 0 {
+			ps = append(ps, r)
 		}
 	}
-	b.ReportMetric(float64(atomic.LoadInt32(n)), "buf")
-	b.ReportMetric(float64(atomic.LoadInt32(counter)), "packets")
+	return ps[:len(ps):len(ps)]
+}
+
+var wholeBuffer = func() [][]byte {
+	buffer := 256 * 1024
+	ps := readPackets("testdata/ip")
+	if len(ps) < 1 {
+		return nil
+	}
+	hdrSize := unix.SizeofSockaddrLinklayer + unix.SizeofTpacket3Hdr
+	totalLen := func(p [][]byte) (_len int) {
+		for i := range p {
+			_len += (len(p[i]) + hdrSize)
+		}
+		return _len + int(unsafe.Sizeof(unix.TpacketBlockDesc{}))
+	}
+	full := ps
+	for (totalLen(full) - totalLen(ps)) <= buffer {
+		full = append(full, ps...)
+	}
+	_len := int(unsafe.Sizeof(unix.TpacketBlockDesc{}))
+	for i := range full {
+		_len += (len(full[i]) + hdrSize)
+		if _len > buffer {
+			_len = i
+			break
+		}
+	}
+	return full[:_len]
+}()
+
+func writeSocket(h raw.Handler) error {
+	for _, v := range wholeBuffer {
+		_, err := h.Write(v, nil, raw.ProtoIP)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writePcap(h *pcap.Handle) error {
+	for _, v := range wholeBuffer {
+		err := h.WritePacketData(v)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"runtime"
 	"sync"
 	"time"
 
@@ -16,7 +15,8 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
-	"golang.org/x/sys/unix"
+	raw "github.com/urbanishimwe/packet"
+	"golang.org/x/net/bpf"
 )
 
 // Handler is a function that is used to handle packets
@@ -41,7 +41,6 @@ type Listener struct {
 	Activate   func() error // function is used to activate the engine. it must be called before reading packets
 	Handles    map[string]gopacket.PacketDataSource
 	Interfaces []net.Interface
-	loopIndex  int
 	Reading    chan bool // this channel is closed when the listener has started reading packets
 	PcapOptions
 	Engine        EngineType
@@ -184,23 +183,6 @@ func (l *Listener) Filter(ifi net.Interface) (filter string) {
 	return
 }
 
-// PcapDumpHandler returns a handler to write packet data in PCAP
-// format, See http://wiki.wireshark.org/Development/LibpcapFileFormathandler.
-// if link layer is invalid Ethernet is assumed
-func PcapDumpHandler(file *os.File, link layers.LinkType) (handler func(packet *Packet) error, err error) {
-	if link.String() == "" {
-		link = layers.LinkTypeEthernet
-	}
-	w := NewWriterNanos(file)
-	err = w.WriteFileHeader(64<<10, link)
-	if err != nil {
-		return nil, err
-	}
-	return func(packet *Packet) error {
-		return w.WritePacket(*packet.Info, packet.Data)
-	}, nil
-}
-
 // PcapHandle returns new pcap Handle from dev on success.
 // this function should be called after setting all necessary options for this listener
 func (l *Listener) PcapHandle(ifi net.Interface) (handle *pcap.Handle, err error) {
@@ -271,14 +253,18 @@ func (l *Listener) PcapHandle(ifi net.Interface) (handle *pcap.Handle, err error
 }
 
 // SocketHandle returns new unix ethernet handle associated with this listener settings
-func (l *Listener) SocketHandle(ifi net.Interface) (handle Socket, err error) {
-	handle, err = NewSocket(ifi)
-	if err != nil {
-		return nil, fmt.Errorf("sock raw error: %q, interface: %q", err, ifi.Name)
+func (l *Listener) socketHandle(ifi net.Interface) (handle *socket, err error) {
+	c := raw.DefaultConfig()
+	if l.BufferSize > 0 {
+		c.ReadBufferSize = int64(l.BufferSize)
 	}
-	if err = handle.SetPromiscuous(l.Promiscuous || l.Monitor); err != nil {
-		return nil, fmt.Errorf("promiscuous mode error: %q, interface: %q", err, ifi.Name)
+	if l.BufferTimeout > 0 {
+		if l.BufferTimeout < time.Millisecond {
+			l.BufferTimeout = time.Millisecond
+		}
 	}
+	c.ReadTimeout = l.BufferTimeout.Milliseconds()
+	c.Promiscuous = l.Promiscuous || l.Monitor
 	if l.BPFFilter != "" {
 		if l.BPFFilter[0] != '(' || l.BPFFilter[len(l.BPFFilter)-1] != ')' {
 			l.BPFFilter = "(" + l.BPFFilter + ")"
@@ -286,12 +272,20 @@ func (l *Listener) SocketHandle(ifi net.Interface) (handle Socket, err error) {
 	} else {
 		l.BPFFilter = l.Filter(ifi)
 	}
-	if err = handle.SetBPFFilter(l.BPFFilter); err != nil {
-		handle.Close()
+	snaplen := 128 * 1024
+	filter, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, snaplen, l.BPFFilter)
+	if err != nil {
 		return nil, fmt.Errorf("BPF filter error: %q%s, interface: %q", err, l.BPFFilter, ifi.Name)
 	}
-	handle.SetLoopbackIndex(int32(l.loopIndex))
-	return
+	f := make([]bpf.RawInstruction, len(filter))
+	for i := range filter {
+		f[i].Op = filter[i].Code
+		f[i].Jt = filter[i].Jt
+		f[i].Jf = filter[i].Jf
+		f[i].K = filter[i].K
+	}
+	c.Filter = f
+	return newSocket(ifi.Name, c)
 }
 
 func (l *Listener) read(handler Handler) {
@@ -300,8 +294,7 @@ func (l *Listener) read(handler Handler) {
 	for key, handle := range l.Handles {
 		go func(key string, hndl gopacket.PacketDataSource) {
 			defer l.closeHandles(key)
-			linkSize := 14
-			linkType := int(layers.LinkTypeEthernet)
+			var linkType, linkSize int
 			if _, ok := hndl.(*pcap.Handle); ok {
 				linkType = int(hndl.(*pcap.Handle).LinkType())
 				linkSize, ok = pcapLinkTypeLength(linkType)
@@ -310,6 +303,12 @@ func (l *Listener) read(handler Handler) {
 						log.Printf("can not identify link type of an interface '%s'\n", key)
 					}
 					return // can't find the linktype size
+				}
+			} else {
+				linkType = int(hndl.(*socket).h.LinkType())
+				linkSize = 14
+				if hndl.(*socket).isCooked() {
+					linkSize = 0
 				}
 			}
 			for {
@@ -325,10 +324,10 @@ func (l *Listener) read(handler Handler) {
 					if enext, ok := err.(pcap.NextError); ok && enext == pcap.NextErrorTimeoutExpired {
 						continue
 					}
-					if eno, ok := err.(unix.Errno); ok && eno.Temporary() {
-						continue
+					if _, ok := err.(raw.ErrBreakLoop); ok {
+						return
 					}
-					if enet, ok := err.(*net.OpError); ok && (enet.Temporary() || enet.Timeout()) {
+					if raw.Temporary(err) || raw.Timeout(err) {
 						continue
 					}
 					if err == io.EOF || err == io.ErrClosedPipe {
@@ -349,8 +348,8 @@ func (l *Listener) closeHandles(key string) {
 	l.Lock()
 	defer l.Unlock()
 	if handle, ok := l.Handles[key]; ok {
-		if _, ok = handle.(Socket); ok {
-			handle.(Socket).Close()
+		if cl, ok := handle.(*socket); ok {
+			cl.Close()
 		} else {
 			handle.(*pcap.Handle).Close()
 		}
@@ -380,14 +379,14 @@ func (l *Listener) activatePcap() error {
 }
 
 func (l *Listener) activateRawSocket() error {
-	if runtime.GOOS != "linux" {
-		return fmt.Errorf("sock_raw is not stabilized on OS other than linux")
+	if !raw.IsOSSupported() {
+		return fmt.Errorf("sock_raw is not supported on OS other than linux")
 	}
 	var msg string
 	var e error
 	for _, ifi := range l.Interfaces {
-		var handle Socket
-		handle, e = l.SocketHandle(ifi)
+		var handle *socket
+		handle, e = l.socketHandle(ifi)
 		if e != nil {
 			msg += ("\n" + e.Error())
 			continue
@@ -431,9 +430,6 @@ func (l *Listener) setInterfaces() (err error) {
 		return
 	}
 	for i := range ifis {
-		if ifis[i].Flags&net.FlagLoopback != 0 {
-			l.loopIndex = ifis[i].Index
-		}
 		if ifis[i].Flags&net.FlagUp == 0 {
 			continue
 		}

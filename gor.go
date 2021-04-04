@@ -29,8 +29,9 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-
+// ./gor --input-raw :8087  --input-raw :8089  --output-stdout --input-raw-track-response --stats
 func main() {
+	// 	进程数如不在环境变量GOMAXPROCS执行，则使用可使用CPU数的2倍
 	if os.Getenv("GOMAXPROCS") == "" {
 		runtime.GOMAXPROCS(runtime.NumCPU() * 2)
 	}
@@ -49,6 +50,7 @@ func main() {
 	} else {
 		flag.Parse()
 		checkSettings()
+		// 指定并初始化所有可用的插件:
 		plugins = NewPlugins()
 	}
 
@@ -73,7 +75,9 @@ func main() {
 	}
 
 	closeCh := make(chan int)
+	// 初始化Emitter，作为输入与输出的桥梁
 	emitter := NewEmitter()
+	// 传入已经初始化好的输入和输出插件，第二个蚕食是使用cmd命令调用
 	go emitter.Start(plugins, Settings.Middleware)
 	if Settings.ExitAfter > 0 {
 		log.Printf("Running gor for a duration of %s\n", Settings.ExitAfter)

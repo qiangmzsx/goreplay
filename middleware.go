@@ -74,6 +74,7 @@ func (m *Middleware) copy(to io.Writer, from PluginReader) {
 	var buf, dst []byte
 
 	for {
+		// 一直循环获取input数据
 		msg, err := from.PluginRead()
 		if err != nil {
 			return
@@ -82,6 +83,7 @@ func (m *Middleware) copy(to io.Writer, from PluginReader) {
 			continue
 		}
 		buf = msg.Data
+		// 解析http格式
 		if Settings.PrettifyHTTP {
 			buf = prettifyHTTP(msg.Data)
 		}

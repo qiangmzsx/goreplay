@@ -35,7 +35,7 @@ func (e *Emitter) Start(plugins *InOutPlugins, middlewareCmd string) {
 		for _, in := range plugins.Inputs {
 			middleware.ReadFrom(in)
 		}
-
+		// 将传入的middlewareCmd新加入到input和all
 		e.plugins.Inputs = append(e.plugins.Inputs, middleware)
 		e.plugins.All = append(e.plugins.All, middleware)
 		e.Add(1)
@@ -46,10 +46,12 @@ func (e *Emitter) Start(plugins *InOutPlugins, middlewareCmd string) {
 			}
 		}()
 	} else {
+		// 可以看出他是支持多个input
 		for _, in := range plugins.Inputs {
 			e.Add(1)
 			go func(in PluginReader) {
 				defer e.Done()
+				// 将输入数据复制给到输出管道
 				if err := CopyMulty(in, plugins.Outputs...); err != nil {
 					Debug(2, fmt.Sprintf("[EMITTER] error during copy: %q", err))
 				}
@@ -102,6 +104,7 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 			if Settings.Verbose >= 3 {
 				Debug(3, "[EMITTER] input: ", byteutils.SliceToString(msg.Meta[:len(msg.Meta)-1]), " from: ", src)
 			}
+			// 重写HTTP header
 			if modifier != nil {
 				Debug(3, "[EMITTER] modifier:", requestID, "from:", src)
 				if isRequestPayload(msg.Meta) {
@@ -122,19 +125,21 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 					}
 				}
 			}
-
+			// 输出详情
 			if Settings.PrettifyHTTP {
 				msg.Data = prettifyHTTP(msg.Data)
 				if len(msg.Data) == 0 {
 					continue
 				}
 			}
-
+			// 开启负载分流
 			if Settings.SplitOutput {
+				// TCP 使用CRC 32hash
 				if Settings.RecognizeTCPSessions {
 					if !PRO {
 						log.Fatal("Detailed TCP sessions work only with PRO license")
 					}
+					// CRC 32
 					hasher := fnv.New32a()
 					hasher.Write(meta[1])
 
@@ -143,7 +148,7 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 						return err
 					}
 				} else {
-					// Simple round robin
+					// Simple round robin,轮询
 					if _, err := writers[wIndex].PluginWrite(msg); err != nil {
 						return err
 					}
@@ -151,14 +156,15 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 					wIndex = (wIndex + 1) % len(writers)
 				}
 			} else {
+				// 所有output全部输出
 				for _, dst := range writers {
 					if _, err := dst.PluginWrite(msg); err != nil {
 						return err
 					}
 				}
 			}
-		}
-
+		}// END_MSG
+		// 控制filteredCount大小在1000左右
 		// Run GC on each 1000 request
 		if filteredCount > 0 && filteredCount%1000 == 0 {
 			// Clean up filtered requests for which we didn't get a response to filter
@@ -173,5 +179,5 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 				filteredRequestsLastCleanTime = time.Now().UnixNano()
 			}
 		}
-	}
+	}// END_FOR
 }
